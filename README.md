@@ -1,6 +1,6 @@
 # Quantum Tunnelling
 
-Python project for simulating quantum tunneling through 1D potential barriers and connecting transmission behavior to an approximate tunnel-diode-style I-V curve.
+Python project for simulating quantum tunneling through 1D potential barriers and connecting resonant-tunneling behavior to an approximate GaAs/AlGaAs RTD I-V curve.
 
 ## What This Project Covers
 
@@ -9,7 +9,7 @@ Python project for simulating quantum tunneling through 1D potential barriers an
 - Wavefunction profile through the barrier
 - Transmission vs energy
 - Transmission vs barrier width
-- Approximate current vs voltage using a Landauer-style integral
+- Temperature-dependent RTD current density with negative differential resistance
 - Double-barrier resonant tunneling with a quantum well
 
 ## Project Layout
@@ -53,4 +53,4 @@ The script generates figures in `outputs/`:
 
 - Energies are shown in `eV`, distances in `nm`.
 - The transmission calculation uses a transfer-matrix solution of the 1D time-independent Schrodinger equation on a piecewise-constant potential.
-- The current model is intentionally approximate and meant for coursework visualization rather than device-grade modeling.
+- The RTD current-density model is intentionally approximate and meant for coursework visualization rather than device-grade modeling.
