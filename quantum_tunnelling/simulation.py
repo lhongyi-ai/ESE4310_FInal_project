@@ -7,7 +7,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-from .constants import ELEMENTARY_CHARGE, PLANCK
+from .constants import BOLTZMANN, ELECTRON_MASS, ELEMENTARY_CHARGE, HBAR, PLANCK
 from .potentials import double_barrier, rectangular_barrier
 from .solver import solve_scattering
 
@@ -44,44 +44,101 @@ def approximate_current(
     )
 
 
-def rtd_current_density(voltages: np.ndarray, temperature_k: float) -> np.ndarray:
-    """Phenomenological GaAs/AlGaAs RTD current density in A/m^2.
+def tilted_double_barrier(
+    x_nm: np.ndarray,
+    voltage: float,
+    barrier_height_ev: float,
+    barrier_width_nm: float,
+    well_width_nm: float,
+) -> np.ndarray:
+    potential = double_barrier(x_nm, barrier_height_ev, barrier_width_nm, well_width_nm)
+    tilt = voltage * (x_nm - x_nm[0]) / (x_nm[-1] - x_nm[0])
+    return potential - tilt
 
-    The previous demo used a tunnel-diode energy-window integral. That captures
-    negative differential resistance, but it misses two RTD-specific effects:
-    the resonant level moves through a tilted double-barrier potential under
-    bias, and high-bias current recovers through thermally assisted/series
-    transport. This compact model follows the same shape expected from a
-    Tsu-Esaki/Fermi-Dirac treatment without making the demo device-grade.
-    """
-    voltage = np.asarray(voltages, dtype=float)
-    scale = 1.0e28
 
-    temperature_points = np.array([77.0, 150.0, 300.0])
-    peak_points = np.array([0.30, 0.50, 0.95])
-    valley_points = np.array([0.012, 0.030, 0.085])
-    high_bias_points = np.array([0.24, 0.74, 2.55])
+def tsu_esaki_supply(energies_ev: np.ndarray, voltage: float, fermi_ev: float, temperature_k: float) -> np.ndarray:
+    kbt_ev = BOLTZMANN * temperature_k / ELEMENTARY_CHARGE
+    left = np.logaddexp(0.0, (fermi_ev - energies_ev) / kbt_ev)
+    right = np.logaddexp(0.0, (fermi_ev - energies_ev - voltage) / kbt_ev)
+    return left - right
 
-    peak_amp = np.interp(temperature_k, temperature_points, peak_points)
-    valley_amp = np.interp(temperature_k, temperature_points, valley_points)
-    high_amp = np.interp(temperature_k, temperature_points, high_bias_points)
 
-    resonance_voltage = 0.132
-    left_width = np.interp(temperature_k, temperature_points, [0.024, 0.035, 0.045])
-    right_width = np.interp(temperature_k, temperature_points, [0.014, 0.016, 0.017])
-    resonance_width = np.where(voltage <= resonance_voltage, left_width, right_width)
-    turn_on = 1.0 - np.exp(-voltage / 0.035)
-    resonant_alignment = np.exp(-0.5 * ((voltage - resonance_voltage) / resonance_width) ** 2)
-    resonant_norm = 1.0 - np.exp(-resonance_voltage / 0.035)
-    resonant_current = peak_amp * turn_on * resonant_alignment / resonant_norm
+def free_electron_rtd_current_density(
+    voltages: np.ndarray,
+    temperature_k: float,
+    energies_ev: np.ndarray,
+    transmission_by_bias: np.ndarray,
+    fermi_ev: float = 0.18,
+) -> np.ndarray:
+    """Free-electron-mass RTD baseline from biased transmission spectra."""
+    prefactor = ELEMENTARY_CHARGE * ELECTRON_MASS * BOLTZMANN * temperature_k / (2.0 * np.pi**2 * HBAR**3)
+    currents = []
 
-    valley_current = valley_amp * (1.0 - np.exp(-voltage / 0.05))
-    valley_current *= 1.0 / (1.0 + np.exp((voltage - 0.30) / 0.055))
+    for voltage, transmission in zip(voltages, transmission_by_bias):
+        supply = tsu_esaki_supply(energies_ev, voltage, fermi_ev, temperature_k)
+        integral = np.trapezoid(transmission * supply, energies_ev * ELEMENTARY_CHARGE)
+        currents.append(prefactor * integral)
 
-    recovery = np.clip((voltage - 0.19) / (0.50 - 0.19), 0.0, None)
-    high_bias_current = high_amp * recovery**2.45
+    return np.array(currents, dtype=float)
 
-    return scale * (resonant_current + valley_current + high_bias_current)
+
+def _gaussian_kernel(sigma_points: float, radius: int) -> np.ndarray:
+    offsets = np.arange(-radius, radius + 1, dtype=float)
+    kernel = np.exp(-0.5 * (offsets / sigma_points) ** 2)
+    return kernel / kernel.sum()
+
+
+def broaden_transmission(transmission_by_bias: np.ndarray, sigma_ev: float, energy_step_ev: float) -> np.ndarray:
+    sigma_points = max(sigma_ev / energy_step_ev, 1e-6)
+    radius = max(2, int(np.ceil(3.0 * sigma_points)))
+    kernel = _gaussian_kernel(sigma_points, radius)
+    padded = np.pad(transmission_by_bias, ((0, 0), (radius, radius)), mode="edge")
+    broadened = np.empty_like(transmission_by_bias)
+
+    for row_idx in range(transmission_by_bias.shape[0]):
+        broadened[row_idx] = np.convolve(padded[row_idx], kernel, mode="valid")
+
+    return broadened
+
+
+def smooth_curve(values: np.ndarray, passes: int = 2) -> np.ndarray:
+    smoothed = np.asarray(values, dtype=float)
+    kernel = np.array([1.0, 4.0, 6.0, 4.0, 1.0]) / 16.0
+    radius = len(kernel) // 2
+
+    for _ in range(passes):
+        padded = np.pad(smoothed, radius, mode="edge")
+        smoothed = np.convolve(padded, kernel, mode="valid")
+
+    return smoothed
+
+
+def biased_transmission_grid(
+    voltages: np.ndarray,
+    energies_ev: np.ndarray,
+    x_nm: np.ndarray,
+    barrier_height_ev: float = 0.35,
+    barrier_width_nm: float = 0.7,
+    well_width_nm: float = 1.2,
+) -> np.ndarray:
+    transmissions = []
+
+    for voltage in voltages:
+        potential_ev = tilted_double_barrier(
+            x_nm,
+            voltage,
+            barrier_height_ev=barrier_height_ev,
+            barrier_width_nm=barrier_width_nm,
+            well_width_nm=well_width_nm,
+        )
+        transmissions.append(
+            [
+                solve_scattering(x_nm, potential_ev, energy_ev, mass=ELECTRON_MASS).transmission
+                for energy_ev in energies_ev
+            ]
+        )
+
+    return np.array(transmissions, dtype=float)
 
 
 def _save_single_barrier_plots(output_dir: Path) -> None:
@@ -142,7 +199,15 @@ def _save_width_sweep_plot(output_dir: Path) -> None:
 
 
 def _save_iv_plot(output_dir: Path) -> None:
-    voltages = np.linspace(0.0, 0.5, 501)
+    x_nm = np.linspace(-4.0, 4.0, 420)
+    energies_ev = np.linspace(0.005, 0.65, 180)
+    voltages = np.linspace(0.0, 0.5, 111)
+    transmission_by_bias = biased_transmission_grid(voltages, energies_ev, x_nm)
+    transmission_by_bias = broaden_transmission(
+        transmission_by_bias,
+        sigma_ev=0.004,
+        energy_step_ev=energies_ev[1] - energies_ev[0],
+    )
     temperatures = [
         (77.0, "#0057b8", "T = 77 K"),
         (150.0, "#00965e", "T = 150 K"),
@@ -151,27 +216,34 @@ def _save_iv_plot(output_dir: Path) -> None:
 
     fig, ax = plt.subplots(figsize=(10.6, 7.4))
     for temperature_k, color, label in temperatures:
+        current_density = free_electron_rtd_current_density(
+            voltages,
+            temperature_k,
+            energies_ev,
+            transmission_by_bias,
+        )
+        current_density = smooth_curve(current_density, passes=2)
         ax.plot(
             voltages * 1000.0,
-            rtd_current_density(voltages, temperature_k),
+            current_density,
             color=color,
             linewidth=3.1,
             label=label,
         )
 
-    ax.set_title("GaAs/AlGaAs RTD I-V Characteristics -- Temperature Dependence", fontsize=16, fontweight="bold")
+    ax.set_title("Free-Electron-Mass RTD Baseline I-V -- Temperature Dependence", fontsize=16, fontweight="bold")
     ax.set_xlabel("Applied Bias (mV)", fontsize=13)
     ax.set_ylabel(r"Current Density J (A/m$^2$)", fontsize=13)
     ax.set_xlim(0, 500)
-    ax.set_ylim(0, 3.0e28)
     ax.set_xticks(np.arange(0, 501, 50))
     ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0), useMathText=True)
     ax.grid(alpha=0.38)
     ax.legend(loc="upper left", frameon=True, fancybox=False, edgecolor="black", fontsize=12)
     ax.text(
-        277,
-        2.28e28,
-        "Tilted potential under bias\nTsu-Esaki formula\nFermi-Dirac statistics",
+        0.54,
+        0.76,
+        "Baseline: m* = m0\nTilted potential under bias\nTsu-Esaki supply",
+        transform=ax.transAxes,
         fontsize=12,
         fontstyle="italic",
         bbox={"boxstyle": "square", "facecolor": "white", "edgecolor": "gray", "alpha": 0.94, "pad": 0.55},
